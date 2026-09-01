@@ -307,3 +307,60 @@ async def test_invalid_token_unauthorized(client):
         headers={"Authorization": "Bearer invalid.token.here"},
     )
     assert response.status_code == 401
+
+
+# ── 三重 AND 校验安全测试 ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_superuser_role_but_wrong_username_403(client):
+    """测试 role=superuser 但 username 不在白名单 → 403。"""
+    headers = {
+        "Authorization": f"Bearer {create_test_token(user_id=999, username='hacker', role='superuser')}"
+    }
+    response = await client.post(
+        "/api/v1/types",
+        headers=headers,
+        json={
+            "type_name": "evil_type",
+            "service_name": "forum",
+            "schema_json": FORUM_SCHEMA,
+        },
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_superuser_role_but_wrong_user_id_403(client):
+    """测试 role=superuser + username 匹配 但 user_id 不在白名单 → 403。"""
+    headers = {
+        "Authorization": f"Bearer {create_test_token(user_id=1, username='superuser', role='superuser')}"
+    }
+    response = await client.post(
+        "/api/v1/types",
+        headers=headers,
+        json={
+            "type_name": "evil_type",
+            "service_name": "forum",
+            "schema_json": FORUM_SCHEMA,
+        },
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_but_role_user_403(client):
+    """测试 username + user_id 都匹配白名单 但 role=user → 403。"""
+    headers = {
+        "Authorization": f"Bearer {create_test_token(user_id=999, username='superuser', role='user')}"
+    }
+    response = await client.post(
+        "/api/v1/types",
+        headers=headers,
+        json={
+            "type_name": "evil_type",
+            "service_name": "forum",
+            "schema_json": FORUM_SCHEMA,
+        },
+    )
+    assert response.status_code == 403

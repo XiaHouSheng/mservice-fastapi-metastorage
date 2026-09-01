@@ -33,9 +33,9 @@ class Settings(BaseSettings):
     JWKS_CACHE_TTL_SECONDS: int = 3600
     ALGORITHM: str = "RS256"
 
-    # 超级用户白名单（兜底路径）
+    # 超级用户白名单（三重 AND 校验：role=superuser + username 匹配 + user_id 匹配，缺一不可）
     SUPERUSER_USERNAMES: List[str] = ["superuser"]
-    SUPERUSER_USER_IDS: List[int] = []
+    SUPERUSER_USER_IDS: List[int] = [1]
 
     # 元数据限额
     MAX_ENTRY_DATA_KEYS: int = 100

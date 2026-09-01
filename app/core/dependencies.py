@@ -59,19 +59,22 @@ async def get_current_user(
 
 
 def _is_superuser(user: CurrentUser) -> bool:
-    """判定是否为超级用户。
+    """判定是否为超级用户（三重 AND 校验，缺一不可）。
 
-    主路径：JWT payload 携带 role=superuser 即放行。
-    兜底路径：JWT 无 role 声明（或 role 非 superuser）时，用 sub/user_id 比对配置白名单。
+    必须同时满足：
+    1. JWT payload 的 role == "superuser"；
+    2. username（sub）在 SUPERUSER_USERNAMES 白名单中；
+    3. user_id 在 SUPERUSER_USER_IDS 白名单中。
+
+    无兜底：任意一项不满足即返回 False，管理接口返回 403。
     """
-    if user.role == "superuser":
-        return True
-    # 兜底：白名单比对
-    if user.sub in settings.SUPERUSER_USERNAMES:
-        return True
-    if user.user_id in settings.SUPERUSER_USER_IDS:
-        return True
-    return False
+    if user.role != "superuser":
+        return False
+    if user.sub not in settings.SUPERUSER_USERNAMES:
+        return False
+    if user.user_id not in settings.SUPERUSER_USER_IDS:
+        return False
+    return True
 
 
 async def require_superuser(

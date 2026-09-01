@@ -175,11 +175,19 @@ curl http://localhost:9093/health
 
 JWKS 缓存带 TTL（`JWKS_CACHE_TTL_SECONDS`，默认 3600 秒）。
 
-### superuser 判定（管理接口）
+### superuser 判定（管理接口）—— 三重 AND 校验，缺一不可
 
-- **主路径**：从 JWT payload 读取 `role` 声明，`role == "superuser"` 放行 `/types` 写操作（user-service 部署时自动创建的 superuser 登录后，其 token 天然携带 `role=superuser`）；
-- **兜底路径**：JWT 无 `role=superuser` 时，用 `sub`/`user_id` 比对配置白名单 `SUPERUSER_USERNAMES` / `SUPERUSER_USER_IDS`，命中视为 superuser；
-- 普通业务 token 只读 `/types`、可写 `/entries`；非 superuser 访问 `/types` 写操作统一返回 **403**。
+管理接口（`POST/PUT/DELETE /types`）要求以下三项**同时成立**：
+
+1. JWT payload 的 `role == "superuser"`；
+2. `sub`（用户名）在配置白名单 `SUPERUSER_USERNAMES` 中；
+3. `user_id` 在配置白名单 `SUPERUSER_USER_IDS` 中。
+
+**无兜底**：任意一项不满足即返回 **403**。即使攻击者注册了用户名为 `superuser` 的账号，只要 `user_id` 不匹配或 `role` 不是 `superuser`，就无法提权。
+
+部署时需将 `SUPERUSER_USER_IDS` 配置为 user-service 中实际 superuser 的用户 ID（user-service 部署引导自动创建的 superuser 通常为 ID=1）。
+
+普通业务 token 只读 `/types`、可写 `/entries`。
 
 ### 资源隔离
 
@@ -244,8 +252,8 @@ Repository 层统一 LogProxy 包裹，`data` 中敏感 key（password/secret/to
 | `USER_SERVICE_URL` | http://localhost:8000 | user-service 地址（拉取 JWKS） |
 | `JWKS_CACHE_TTL_SECONDS` | 3600 | JWKS 缓存 TTL（秒） |
 | `ALGORITHM` | RS256 | JWT 签名算法 |
-| `SUPERUSER_USERNAMES` | ["superuser"] | superuser 用户名白名单（兜底） |
-| `SUPERUSER_USER_IDS` | [] | superuser 用户 ID 白名单（兜底） |
+| `SUPERUSER_USERNAMES` | ["superuser"] | superuser 用户名白名单（三重 AND 校验之一） |
+| `SUPERUSER_USER_IDS` | [1] | superuser 用户 ID 白名单（三重 AND 校验之一，部署时改为实际 ID） |
 | `MAX_ENTRY_DATA_KEYS` | 100 | 单条 entry data 最大字段数 |
 | `MAX_ENTRY_DATA_DEPTH` | 5 | data 嵌套最大深度 |
 | `MAX_TAGS_PER_ENTRY` | 20 | 单条 entry 最多 tags 数 |
@@ -304,7 +312,7 @@ pytest tests/ -v
 1. **user-service 部署**：按 `.env` 配置 `SUPERUSER_USERNAME` / `SUPERUSER_PASSWORD`，启动时自动创建 `role=superuser` 的超级用户；
 2. **获取 token**：superuser 或普通用户通过 user-service 的 `POST /api/v1/auth/login` 获取 JWT，payload 携带 `sub / user_id / service_name / role / type`；
 3. **本服务校验**：请求头携带 `Authorization: Bearer <token>`，本服务从 user-service 拉取 JWKS 公钥验证签名（RS256），兼容密钥轮换；
-4. **权限判定**：`role=superuser` 可管理 `/types`；普通用户可读写 `/entries`；资源按 `service_name` / `owner_user_id` 隔离。
+4. **权限判定**：管理接口需三重 AND 校验（`role=superuser` + `username` 白名单匹配 + `user_id` 白名单匹配）；普通用户可读写 `/entries`；资源按 `service_name` / `owner_user_id` 隔离。
 
 ## 使用示例
 

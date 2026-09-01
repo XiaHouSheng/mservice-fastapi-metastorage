@@ -10,8 +10,10 @@ services:
       # user-service 对接：Docker 同网络内用服务名 user-service；若 user-service 在外部则改实际地址
       - USER_SERVICE_URL=http://user-service:8000
       - JWKS_CACHE_TTL_SECONDS=3600
+      # superuser 三重 AND 校验：role=superuser + username 匹配 + user_id 匹配，缺一不可
+      # 部署时请将 SUPERUSER_USER_IDS 改为 user-service 中实际 superuser 的 ID
       - SUPERUSER_USERNAMES=["superuser"]
-      - SUPERUSER_USER_IDS=[]
+      - SUPERUSER_USER_IDS=[1]
       - MAX_ENTRY_DATA_KEYS=100
       - MAX_ENTRY_DATA_DEPTH=5
       - MAX_TAGS_PER_ENTRY=20

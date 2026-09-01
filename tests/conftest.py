@@ -15,6 +15,9 @@ from jose import jwt
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./data/test_meta_service.db"
 os.environ["USER_SERVICE_URL"] = "http://localhost:8000"
 os.environ["ALGORITHM"] = "RS256"
+# 测试 superuser 使用 user_id=999, username=superuser, role=superuser（三重 AND 校验）
+os.environ["SUPERUSER_USERNAMES"] = '["superuser"]'
+os.environ["SUPERUSER_USER_IDS"] = "[999]"
 
 from app.core.database import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
