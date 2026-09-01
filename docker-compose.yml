@@ -1,0 +1,31 @@
+services:
+  meta-service:
+    build: .
+    container_name: meta-service
+    ports:
+      - "9093:9093"
+    environment:
+      - APP_ENV=production
+      - DATABASE_URL=sqlite+aiosqlite:///./data/meta_service.db
+      # user-service 对接：Docker 同网络内用服务名 user-service；若 user-service 在外部则改实际地址
+      - USER_SERVICE_URL=http://user-service:8000
+      - JWKS_CACHE_TTL_SECONDS=3600
+      - SUPERUSER_USERNAMES=["superuser"]
+      - SUPERUSER_USER_IDS=[]
+      - MAX_ENTRY_DATA_KEYS=100
+      - MAX_ENTRY_DATA_DEPTH=5
+      - MAX_TAGS_PER_ENTRY=20
+      - MAX_TAG_LENGTH=50
+      - MAX_VERSION_KEPT=50
+      - ENTRY_KEY_MAX_LENGTH=255
+      - LOG_LEVEL=INFO
+    volumes:
+      # SQLite 数据库及 WAL/SHM 辅助文件持久化到宿主机 ./data 目录
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9093/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

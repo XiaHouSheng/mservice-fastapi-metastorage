@@ -1,0 +1,36 @@
+# Python 字节缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 分发 / 打包
+build/
+dist/
+*.egg-info/
+
+# 单元测试 / 覆盖率
+.pytest_cache/
+.coverage
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# 日志、数据库、临时文件
+*.log
+*.sqlite
+*.db
+*.tmp
+
+# 环境变量文件（重要！不要提交密钥）
+.env
+.env.local
+
+# macOS / Windows 系统文件
+.DS_Store
+Thumbs.db

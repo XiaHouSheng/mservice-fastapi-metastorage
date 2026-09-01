@@ -1,0 +1,19 @@
+# Web 框架
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+# 数据库
+SQLAlchemy>=2.0.30
+aiosqlite>=0.20.0
+# 数据验证
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+# 安全（JWT 校验，消费 user-service 令牌）
+python-jose[cryptography]>=3.3.0
+cryptography>=42.0.0
+# HTTP 客户端（拉取 user-service JWKS）
+httpx>=0.27.0
+# 说明
+# - 不含 alembic（建表走 init_db 自动 create_all，对齐参照项目现状）
+# - 本服务不签发令牌，无需 passlib/bcrypt
+# - 生产使用纯 uvicorn；热重载与测试依赖见 requirements-dev.txt
