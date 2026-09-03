@@ -65,12 +65,21 @@ async def list_types(
     service_name: str | None = Query(None, description="按业务名筛选（跨服务需 superuser）"),
 ) -> dict[str, object]:
     """分页获取元数据类型列表。"""
-    target_service = _resolve_service_name(
-        service_name,
-        current_user,
-        is_superuser,
-        action="查看类型",
-    )
+    # 显式跨服务筛选：仅 superuser 允许
+    if (
+        service_name is not None
+        and service_name != current_user.service_name
+        and not is_superuser
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"仅超级用户可跨服务查看，当前用户仅可查看服务 {current_user.service_name}",
+        )
+    # 普通用户未指定时强制限定自身服务；superuser 未指定时返回所有服务
+    target_service = service_name
+    if target_service is None and not is_superuser:
+        target_service = current_user.service_name
+
     type_service = TypeService(db)
     types, total = await type_service.list_types(
         skip=skip, limit=limit, service_name=target_service

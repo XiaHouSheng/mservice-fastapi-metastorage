@@ -452,3 +452,26 @@ async def test_list_types_cross_service_normal_user_forbidden(client):
     )
     assert response.status_code == 403
     assert "仅超级用户可跨服务" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_list_types_superuser_sees_all_services(client):
+    """测试 superuser 列表不传 service_name 时返回所有服务的类型。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "forum_post", "service_name": "forum", "schema_json": FORUM_SCHEMA},
+    )
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "default_post", "service_name": "default", "schema_json": FORUM_SCHEMA},
+    )
+    response = await client.get(
+        "/api/v1/types",
+        headers=_headers_for("default", user_id=999, username="superuser", role="superuser"),
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert {item["type_name"] for item in data["items"]} == {"forum_post", "default_post"}
