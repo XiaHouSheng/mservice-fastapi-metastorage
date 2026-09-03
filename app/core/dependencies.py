@@ -58,7 +58,7 @@ async def get_current_user(
     )
 
 
-def _is_superuser(user: CurrentUser) -> bool:
+def is_superuser(user: CurrentUser) -> bool:
     """判定是否为超级用户（三重 AND 校验，缺一不可）。
 
     必须同时满足：
@@ -77,11 +77,18 @@ def _is_superuser(user: CurrentUser) -> bool:
     return True
 
 
+async def get_superuser_flag(
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> bool:
+    """返回当前用户是否为 superuser（非强制依赖，用于需要跨服务权限判断的接口）。"""
+    return is_superuser(current_user)
+
+
 async def require_superuser(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> CurrentUser:
     """管理接口依赖：仅 superuser 可调用，否则返回 403。"""
-    if not _is_superuser(current_user):
+    if not is_superuser(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="仅超级用户可执行此操作",

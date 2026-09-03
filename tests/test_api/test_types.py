@@ -364,3 +364,91 @@ async def test_correct_identity_but_role_user_403(client):
         },
     )
     assert response.status_code == 403
+
+
+# ── 跨服务访问权限（仅 superuser 可跨服务查看/操作）────────
+
+
+def _headers_for(service_name: str, *, user_id: int = 2, username: str = "normal", role: str = "user"):
+    return {
+        "Authorization": f"Bearer {create_test_token(user_id=user_id, username=username, role=role, service_name=service_name)}"
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_type_cross_service_normal_user_forbidden(client):
+    """测试普通用户显式跨服务查询类型详情返回 403。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "forum_post", "service_name": "forum", "schema_json": FORUM_SCHEMA},
+    )
+    response = await client.get(
+        "/api/v1/types/forum_post?service_name=forum",
+        headers=_headers_for("default"),
+    )
+    assert response.status_code == 403
+    assert "仅超级用户可跨服务" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_type_cross_service_superuser_ok(client):
+    """测试 superuser 显式跨服务查询类型详情成功。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "forum_post", "service_name": "forum", "schema_json": FORUM_SCHEMA},
+    )
+    response = await client.get(
+        "/api/v1/types/forum_post?service_name=forum",
+        headers=_headers_for("default", user_id=999, username="superuser", role="superuser"),
+    )
+    assert response.status_code == 200
+    assert response.json()["service_name"] == "forum"
+
+
+@pytest.mark.asyncio
+async def test_get_type_defaults_to_own_service(client):
+    """测试未指定 service_name 时按当前用户所属服务查询。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "forum_post", "service_name": "forum", "schema_json": FORUM_SCHEMA},
+    )
+    # 普通用户属于 default 服务，不带 service_name 查询 forum 下的类型 → 404
+    response = await client.get(
+        "/api/v1/types/forum_post",
+        headers=_headers_for("default"),
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_types_normal_user_only_own_service(client):
+    """测试普通用户列表不传 service_name 时仅返回自己服务的类型。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "forum_post", "service_name": "forum", "schema_json": FORUM_SCHEMA},
+    )
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "default_post", "service_name": "default", "schema_json": FORUM_SCHEMA},
+    )
+    response = await client.get("/api/v1/types", headers=_headers_for("default"))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["items"][0]["type_name"] == "default_post"
+
+
+@pytest.mark.asyncio
+async def test_list_types_cross_service_normal_user_forbidden(client):
+    """测试普通用户列表显式跨服务筛选返回 403。"""
+    response = await client.get(
+        "/api/v1/types?service_name=forum",
+        headers=_headers_for("default"),
+    )
+    assert response.status_code == 403
+    assert "仅超级用户可跨服务" in response.json()["detail"]
