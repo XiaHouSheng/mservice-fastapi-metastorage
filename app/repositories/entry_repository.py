@@ -183,12 +183,10 @@ class EntryRepository:
         limit: int = 20,
         sort_by: str = "created_at",
         sort_order: str = "desc",
-        visible_service_names: list[str] | None = None,
-        visible_user_id: int | None = None,
     ) -> tuple[list[MetadataEntry], int]:
-        """复杂查询：字段过滤 + tags 交集 + 时间范围 + 分页 + 排序 + 可见性隔离。
+        """复杂查询：字段过滤 + tags 交集 + 时间范围 + 分页 + 排序 + service 隔离。
 
-        可见性规则：仅返回 (service_name IN visible_service_names) OR (owner_user_id == visible_user_id) 的数据。
+        service_name 由上层 MetaScope 统一解析（普通身份强制自身 service，superuser 可全量/按指定）。
         """
         # 基础查询（join type 表以支持 type_name 过滤和响应中的 type_name）
         stmt = select(MetadataEntry).join(
@@ -201,19 +199,7 @@ class EntryRepository:
         if type_name:
             conditions.append(MetadataType.type_name == type_name)
 
-        # 可见性隔离
-        if visible_service_names or visible_user_id is not None:
-            visibility = []
-            if visible_service_names:
-                visibility.append(MetadataEntry.service_name.in_(visible_service_names))
-            if visible_user_id is not None:
-                visibility.append(MetadataEntry.owner_user_id == visible_user_id)
-            if visibility:
-                from sqlalchemy import or_
-
-                conditions.append(or_(*visibility))
-
-        # service_name 直接过滤
+        # service_name 隔离（由上层 Scope 解析）
         if service_name:
             conditions.append(MetadataEntry.service_name == service_name)
 

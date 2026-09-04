@@ -501,3 +501,308 @@ async def test_no_token_unauthorized(client):
     """测试无 token 访问 entries 返回 401。"""
     response = await client.get("/api/v1/entries")
     assert response.status_code == 401
+
+
+# ── 复合类型字段校验 ──────────────────────────────────────
+
+COMPOSITE_SCHEMA = {
+    "fields": {
+        "title": {"type": "string", "required": True},
+        "tags": {"type": "list", "items": {"type": "string"}},
+        "metadata": {"type": "dict", "values": {"type": "string"}},
+        "author": {
+            "type": "object",
+            "fields": {
+                "name": {"type": "string", "required": True},
+                "age": {"type": "integer"},
+            },
+        },
+    }
+}
+
+
+async def _create_composite_type(client):
+    return await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={
+            "type_name": "article",
+            "service_name": "forum",
+            "schema_json": COMPOSITE_SCHEMA,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_entry_with_composite_fields_success(client):
+    """测试写入含 list/dict/object 复合字段的元数据成功。"""
+    await _create_composite_type(client)
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(),
+        json={
+            "type_name": "article",
+            "entity_key": "art-001",
+            "data": {
+                "title": "复合类型测试",
+                "tags": ["python", "fastapi"],
+                "metadata": {"level": "beginner"},
+                "author": {"name": "alice", "age": 25},
+            },
+            "tags": [],
+        },
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["data"]["tags"] == ["python", "fastapi"]
+    assert data["data"]["metadata"] == {"level": "beginner"}
+    assert data["data"]["author"] == {"name": "alice", "age": 25}
+
+
+@pytest.mark.asyncio
+async def test_create_entry_composite_wrong_type_422(client):
+    """测试复合字段类型错误返回 422。"""
+    await _create_composite_type(client)
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(),
+        json={
+            "type_name": "article",
+            "entity_key": "art-002",
+            "data": {
+                "title": "错误类型",
+                "tags": ["ok", 123],  # list items 应为 string
+                "author": {"name": "alice", "age": "not-an-int"},  # age 应为 integer
+            },
+            "tags": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_entry_object_missing_required_subfield_422(client):
+    """测试 object 缺少必填子字段返回 422。"""
+    await _create_composite_type(client)
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(),
+        json={
+            "type_name": "article",
+            "entity_key": "art-003",
+            "data": {"title": "缺子字段", "author": {"age": 20}},  # 缺 author.name
+            "tags": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+# ── superuser 跨服务访问 ──────────────────────────────────
+
+
+def _superuser_headers_for(service_name: str = "default"):
+    return {
+        "Authorization": f"Bearer {create_test_token(user_id=999, username='superuser', role='superuser', service_name=service_name)}"
+    }
+
+
+@pytest.mark.asyncio
+async def test_superuser_cross_service_get_entry_ok(client):
+    """测试 superuser 可跨服务获取实体。"""
+    await _create_type(client)
+    # alice (forum) 创建实体
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=1, username="alice", service_name="forum"),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-001",
+            "data": {"title": "alice的帖子", "board": "技术"},
+            "tags": [],
+        },
+    )
+    # superuser 属于 default 服务，但可访问 forum 的实体
+    response = await client.get(
+        "/api/v1/entries/forum_post/post-001",
+        headers=_superuser_headers_for("default"),
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["title"] == "alice的帖子"
+
+
+@pytest.mark.asyncio
+async def test_superuser_cross_service_update_entry_ok(client):
+    """测试 superuser 可跨服务更新实体。"""
+    await _create_type(client)
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=1, username="alice", service_name="forum"),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-001",
+            "data": {"title": "原文", "board": "技术", "likes": 1},
+            "tags": [],
+        },
+    )
+    response = await client.put(
+        "/api/v1/entries/forum_post/post-001",
+        headers=_superuser_headers_for("default"),
+        json={"data": {"likes": 999}},
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["likes"] == 999
+
+
+@pytest.mark.asyncio
+async def test_superuser_query_all_services(client):
+    """测试 superuser 查询返回所有 service 的实体。"""
+    # forum 与 shop 两个服务的类型 + 实体
+    await _create_type(client)  # forum_post / forum
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={
+            "type_name": "shop_item",
+            "service_name": "shop",
+            "schema_json": FORUM_SCHEMA,
+        },
+    )
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=1, username="alice", service_name="forum"),
+        json={"type_name": "forum_post", "entity_key": "post-a", "data": {"title": "A", "board": "技术"}, "tags": []},
+    )
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=2, username="bob", service_name="shop"),
+        json={"type_name": "shop_item", "entity_key": "item-a", "data": {"title": "B", "board": "技术"}, "tags": []},
+    )
+    response = await client.get("/api/v1/entries", headers=_superuser_headers_for("default"))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert {item["entity_key"] for item in data["items"]} == {"post-a", "item-a"}
+
+
+@pytest.mark.asyncio
+async def test_superuser_query_filter_by_service(client):
+    """测试 superuser 通过 service_name 筛选跨服务查询。"""
+    await _create_type(client)  # forum_post / forum
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={
+            "type_name": "shop_item",
+            "service_name": "shop",
+            "schema_json": FORUM_SCHEMA,
+        },
+    )
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=1, username="alice", service_name="forum"),
+        json={"type_name": "forum_post", "entity_key": "post-a", "data": {"title": "A", "board": "技术"}, "tags": []},
+    )
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=2, username="bob", service_name="shop"),
+        json={"type_name": "shop_item", "entity_key": "item-a", "data": {"title": "B", "board": "技术"}, "tags": []},
+    )
+    response = await client.get(
+        "/api/v1/entries?service_name=forum", headers=_superuser_headers_for("default")
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["items"][0]["entity_key"] == "post-a"
+
+
+@pytest.mark.asyncio
+async def test_normal_user_query_cross_service_forbidden(client):
+    """测试普通用户查询显式跨 service 筛选返回 403。"""
+    await _create_type(client)
+    response = await client.get(
+        "/api/v1/entries?service_name=shop",
+        headers=_user_headers(service_name="forum"),
+    )
+    assert response.status_code == 403
+    assert "仅超级用户可跨服务" in response.json()["detail"]
+
+
+# ── 创建操作的统一 Scope 判定 ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_entry_superuser_cross_service_via_body(client):
+    """测试 superuser（GLOBAL scope）通过请求体 service_name 跨服务创建实体。"""
+    await _create_type(client)  # forum_post / forum
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_superuser_headers_for("default"),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-super",
+            "data": {"title": "super创建的帖子", "board": "技术", "likes": 1},
+            "tags": [],
+            "service_name": "forum",
+        },
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["service_name"] == "forum"
+    assert data["data"]["title"] == "super创建的帖子"
+
+
+@pytest.mark.asyncio
+async def test_create_entry_normal_user_cross_service_forbidden(client):
+    """测试普通用户请求体指定其他 service 创建返回 403（统一 Scope）。"""
+    await _create_type(client)  # forum_post / forum
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(service_name="forum"),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-x",
+            "data": {"title": "越权", "board": "技术"},
+            "tags": [],
+            "service_name": "shop",
+        },
+    )
+    assert response.status_code == 403
+    assert "仅超级用户可跨服务" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_create_entry_normal_user_own_service_explicit_ok(client):
+    """测试普通用户请求体显式指定自身 service 创建成功。"""
+    await _create_type(client)  # forum_post / forum
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(service_name="forum"),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-own",
+            "data": {"title": "自身服务", "board": "技术"},
+            "tags": [],
+            "service_name": "forum",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["service_name"] == "forum"
+
+
+@pytest.mark.asyncio
+async def test_normal_user_create_defaults_to_own_service(client):
+    """测试普通用户未指定 service_name 时默认归属自身 service（统一 Scope）。"""
+    await _create_type(client)  # forum_post / forum
+    response = await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(service_name="forum"),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-default",
+            "data": {"title": "默认服务", "board": "技术"},
+            "tags": [],
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["service_name"] == "forum"

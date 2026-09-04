@@ -1,4 +1,4 @@
-"""元数据实体业务逻辑层：写读查 / 版本 / 回滚 / 可见性隔离。"""
+"""元数据实体业务逻辑层：写读查 / 版本 / 回滚 / 统一 Scope 权限隔离。"""
 
 from datetime import datetime, timezone
 from typing import Any
@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.dependencies import CurrentUser
+from app.core.dependencies import CurrentUser, MetaScope
 from app.models.metadata_entry import MetadataEntry, MetadataVersion
 from app.proxy.log_proxy import LogProxy
 from app.repositories.entry_repository import EntryRepository
@@ -26,18 +26,6 @@ def _deep_merge(base: dict, update: dict) -> dict:
     return result
 
 
-def _check_visibility(entry: MetadataEntry, user: CurrentUser) -> None:
-    """检查当前用户是否有权访问该实体（owner 或同 service_name），越权返回 403。"""
-    if entry.owner_user_id == user.user_id:
-        return
-    if entry.service_name == user.service_name:
-        return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="无权访问此元数据",
-    )
-
-
 def _validate_tags(tags: list[str]) -> None:
     """校验 tags 数量与单 tag 长度。"""
     if len(tags) > settings.MAX_TAGS_PER_ENTRY:
@@ -54,7 +42,12 @@ def _validate_tags(tags: list[str]) -> None:
 
 
 class EntryService:
-    """元数据实体业务逻辑层。"""
+    """元数据实体业务逻辑层。
+
+    所有操作（list / get / create / update / delete / versions / rollback）统一经 MetaScope 做权限判定：
+    - GLOBAL scope（superuser）：可操作任意 service；
+    - SERVICE scope（普通身份）：仅可操作自身 service。
+    """
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -62,25 +55,27 @@ class EntryService:
         self.type_service = TypeService(db)
 
     async def _find_entry(
-        self, type_name: str, entity_key: str, current_user: CurrentUser
+        self, type_name: str, entity_key: str, scope: MetaScope
     ) -> MetadataEntry:
-        """联表查找实体并校验可见性，不存在返回 404，越权返回 403。"""
+        """联表查找实体并做 Scope 访问校验，不存在返回 404，越权返回 403。"""
         entry = await self.repo.get_by_type_name_and_key(type_name, entity_key)
         if entry is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"实体 {entity_key} 不存在",
             )
-        _check_visibility(entry, current_user)
+        scope.check_entry_access(entry, action="访问元数据")
         return entry
 
     async def create_entry(
-        self, entry_data: MetadataEntryCreate, current_user: CurrentUser
+        self, entry_data: MetadataEntryCreate, current_user: CurrentUser, scope: MetaScope
     ) -> MetadataEntry:
-        """创建实体元数据。"""
-        # 校验类型存在（仅本 service 的类型可用于创建）
+        """创建实体元数据（统一 Scope：普通身份仅本 service，superuser 可指定跨 service）。"""
+        # 解析目标 service（显式跨服务仅 GLOBAL scope 允许）
+        target_service = scope.resolve_target(entry_data.service_name, action="创建元数据")
+        # 校验类型存在（目标 service 下的类型）
         metadata_type = await self.type_service.get_type_by_name(
-            entry_data.type_name, current_user.service_name
+            entry_data.type_name, target_service
         )
         # 校验 tags
         _validate_tags(entry_data.tags)
@@ -100,16 +95,20 @@ class EntryService:
             data=validated_data,
             tags=entry_data.tags,
             version=1,
-            service_name=current_user.service_name,
+            service_name=target_service,
             owner_user_id=current_user.user_id,
         )
         return await self.repo.create(entry)
 
     async def get_entry(
-        self, type_name: str, entity_key: str, current_user: CurrentUser, version: int | None = None
+        self,
+        type_name: str,
+        entity_key: str,
+        scope: MetaScope,
+        version: int | None = None,
     ) -> MetadataEntry:
         """获取实体元数据（支持指定历史版本）。"""
-        entry = await self._find_entry(type_name, entity_key, current_user)
+        entry = await self._find_entry(type_name, entity_key, scope)
 
         if version is not None:
             if version == entry.version:
@@ -132,9 +131,10 @@ class EntryService:
         entity_key: str,
         update_data: MetadataEntryUpdate,
         current_user: CurrentUser,
+        scope: MetaScope,
     ) -> MetadataEntry:
         """更新实体元数据（部分更新 deep merge，版本自增，保留历史版本）。"""
-        entry = await self._find_entry(type_name, entity_key, current_user)
+        entry = await self._find_entry(type_name, entity_key, scope)
 
         # 通过 entry.type_id 获取类型定义（用于 schema 校验）
         metadata_type = await self.type_service.get_type_by_id(entry.type_id)
@@ -171,16 +171,17 @@ class EntryService:
         return result
 
     async def delete_entry(
-        self, type_name: str, entity_key: str, current_user: CurrentUser
+        self, type_name: str, entity_key: str, scope: MetaScope
     ) -> None:
         """软删除实体元数据。"""
-        entry = await self._find_entry(type_name, entity_key, current_user)
+        entry = await self._find_entry(type_name, entity_key, scope)
         await self.repo.soft_delete(entry)
 
     async def query_entries(
         self,
-        current_user: CurrentUser,
+        scope: MetaScope,
         *,
+        service_name: str | None = None,
         type_name: str | None = None,
         field_filters: dict[str, Any] | None = None,
         tags: list[str] | None = None,
@@ -191,9 +192,16 @@ class EntryService:
         sort_by: str = "created_at",
         sort_order: str = "desc",
     ) -> tuple[list[MetadataEntry], int]:
-        """复杂查询：字段过滤 + tags 交集 + 时间范围 + 分页 + 排序 + 可见性隔离。"""
+        """复杂查询：字段过滤 + tags 交集 + 时间范围 + 分页 + 排序 + 统一 Scope 隔离。
+
+        可见性规则（resolve_filter）：
+        - GLOBAL：未指定 service_name → 全部；指定 → 按指定过滤；
+        - SERVICE：强制仅返回自身 service 的数据，显式跨 service → 403。
+        """
+        target_service = scope.resolve_filter(service_name, action="查看元数据")
         return await self.repo.query_entries(
             type_name=type_name,
+            service_name=target_service,
             field_filters=field_filters,
             tags=tags,
             created_after=created_after,
@@ -202,20 +210,18 @@ class EntryService:
             limit=limit,
             sort_by=sort_by,
             sort_order=sort_order,
-            visible_service_names=[current_user.service_name],
-            visible_user_id=current_user.user_id,
         )
 
     async def get_versions(
         self,
         type_name: str,
         entity_key: str,
-        current_user: CurrentUser,
+        scope: MetaScope,
         skip: int = 0,
         limit: int = 50,
     ) -> tuple[list[MetadataVersion], int]:
         """获取实体的版本历史列表。"""
-        entry = await self._find_entry(type_name, entity_key, current_user)
+        entry = await self._find_entry(type_name, entity_key, scope)
         return await self.repo.get_versions(entry.id, skip=skip, limit=limit)
 
     async def rollback_entry(
@@ -224,9 +230,10 @@ class EntryService:
         entity_key: str,
         target_version: int,
         current_user: CurrentUser,
+        scope: MetaScope,
     ) -> MetadataEntry:
         """回滚到指定版本（生成新版本，数据取回滚目标，不删除中间版本）。"""
-        entry = await self._find_entry(type_name, entity_key, current_user)
+        entry = await self._find_entry(type_name, entity_key, scope)
 
         if target_version == entry.version:
             raise HTTPException(

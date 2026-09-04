@@ -156,7 +156,7 @@ curl http://localhost:9093/health
 | GET | `/entries/{type_name}/{entity_key}` | 获取元数据（支持 `?version=`） | 登录用户 |
 | PUT | `/entries/{type_name}/{entity_key}` | 更新元数据（deep merge，版本自增） | 登录用户 |
 | DELETE | `/entries/{type_name}/{entity_key}` | 软删除元数据 | 登录用户 |
-| GET | `/entries` | 查询（字段过滤 + tags + 分页 + 排序） | 登录用户 |
+| GET | `/entries` | 查询（字段过滤 + tags + 分页 + 排序，`service_name` 跨服务筛选仅 superuser） | 登录用户 |
 | GET | `/entries/{type_name}/{entity_key}/versions` | 版本历史列表 | 登录用户 |
 | POST | `/entries/{type_name}/{entity_key}/rollback` | 回滚到指定版本 | 登录用户 |
 | GET | `/health` | 健康检查 | 公开 |
@@ -189,17 +189,40 @@ JWKS 缓存带 TTL（`JWKS_CACHE_TTL_SECONDS`，默认 3600 秒）。
 
 普通业务 token 只读 `/types`、可写 `/entries`。
 
-### 资源隔离
+### 统一权限 Scope（所有 Meta 操作共用）
 
-- 写入时从 JWT 提取 `user_id` 与 `service_name` 作为归属；
-- 单实体访问：非 owner 且非同 service_name 越权 **403**；
-- 列表查询：仅返回 `(service_name == 当前用户 service_name) OR (owner_user_id == 当前用户 user_id)` 的数据。
+所有 Meta 操作（类型与实体的 list / get / create / update / delete 等）统一经 `MetaScope` 做权限判定，权限判断逻辑收敛在 `app/core/dependencies.py`，不在各端点散落：
+
+| Scope | 身份 | 可操作范围 |
+|-------|------|-----------|
+| `global` | superuser（role + 用户名 + user_id 三重校验通过） | **任意 service**：跨服务创建/查询/访问均可 |
+| `service` | 普通 service 身份 | **仅自身 service**：显式跨 service 一律 **403** |
+
+判定入口（`MetaScope` 方法）：
+
+- `require_global(action)`：管理操作（类型 create/update/delete），仅 `global` 允许，否则 403；
+- `resolve_target(requested, action)`：单实体 / 创建操作的目标 service——未指定默认自身，显式跨 service 仅 `global` 允许；
+- `resolve_filter(requested, action)`：列表 / 查询的 service 过滤——普通身份强制自身 service，`global` 可全量或按指定；
+- `check_entry_access(entry, action)`：单实体访问——`global` 放行，普通身份仅自身 service。
+
+写入时从 JWT 提取 `user_id` 与 `service_name` 作为归属；superuser 可通过创建请求体或查询参数 `service_name` 指定其他 service。
 
 ## 核心功能说明
 
 ### 动态 Schema 校验
 
-类型创建时定义字段 schema（`{"fields": {"字段名": {"type": "string|integer|number|boolean", "required": bool, "indexed": bool, "default": any}}}`），写入实体时运行时用 Pydantic `create_model` 动态构造校验模型，**禁止硬编码业务字段**。
+类型创建时定义字段 schema（`{"fields": {"字段名": {"type": "...", "required": bool, "indexed": bool, "default": any}}}`），写入实体时运行时用 Pydantic `create_model` 动态构造校验模型，**禁止硬编码业务字段**。
+
+支持的字段类型：
+
+| 类型 | 说明 | 可配子定义 |
+|------|------|------------|
+| `string` / `integer` / `number` / `boolean` | 基础类型 | 无 |
+| `list` | 数组 | `items`：元素类型定义（可嵌套复合类型，如 `{"type":"list","items":{"type":"object","fields":{...}}}`） |
+| `dict` | 键值映射 | `values`：值类型定义（可嵌套复合类型） |
+| `object` | 结构化嵌套对象 | `fields`：子字段定义（递归结构，可多层嵌套） |
+
+子定义格式与字段定义一致，未提供时 `list`/`dict`/`object` 按任意结构校验。
 
 - 未知字段 / 类型错误 / 超长返回 **422**；
 - 限制 `data` 字段数（`MAX_ENTRY_DATA_KEYS`）和嵌套深度（`MAX_ENTRY_DATA_DEPTH`），防深递归 / ReDoS。
@@ -209,7 +232,8 @@ JWKS 缓存带 TTL（`JWKS_CACHE_TTL_SECONDS`，默认 3600 秒）。
 更新类型 schema 时**仅允许新增字段**：
 - 移除已有字段 → **422**；
 - 修改已有字段类型 → **422**；
-- 新增可选/必填字段 → 允许。
+- 新增可选/必填字段 → 允许；
+- 复合类型同样受限：修改 `list.items` / `dict.values` 的子类型 → **422**；移除 `object` 已有子字段 → **422**；`object` 内新增子字段 → 允许。
 
 ### 版本管理与回滚
 
@@ -312,7 +336,7 @@ pytest tests/ -v
 1. **user-service 部署**：按 `.env` 配置 `SUPERUSER_USERNAME` / `SUPERUSER_PASSWORD`，启动时自动创建 `role=superuser` 的超级用户；
 2. **获取 token**：superuser 或普通用户通过 user-service 的 `POST /api/v1/auth/login` 获取 JWT，payload 携带 `sub / user_id / service_name / role / type`；
 3. **本服务校验**：请求头携带 `Authorization: Bearer <token>`，本服务从 user-service 拉取 JWKS 公钥验证签名（RS256），兼容密钥轮换；
-4. **权限判定**：管理接口需三重 AND 校验（`role=superuser` + `username` 白名单匹配 + `user_id` 白名单匹配）；普通用户可读写 `/entries`；资源按 `service_name` / `owner_user_id` 隔离。
+4. **权限判定**：管理接口需三重 AND 校验（`role=superuser` + `username` 白名单匹配 + `user_id` 白名单匹配）；所有 Meta 操作统一经 `MetaScope` 判定——superuser 拥有 `global` scope（可操作任意 service），普通 service 身份仅有 `service` scope（仅可操作自身 service）。
 
 ## 使用示例
 
@@ -349,6 +373,40 @@ curl -X POST http://localhost:9093/api/v1/entries \
     "data": {"title": "如何配置 JWT 密钥轮换", "board": "技术", "likes": 128},
     "tags": ["fastapi", "jwt", "教程"]
   }'
+```
+
+### 2.1 复合类型示例（list / dict / object）
+
+```bash
+curl -X POST http://localhost:9093/api/v1/types \
+  -H "Authorization: Bearer <superuser_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type_name": "article",
+    "service_name": "forum",
+    "schema_json": {
+      "fields": {
+        "title":    {"type": "string", "required": true},
+        "tags":     {"type": "list", "items": {"type": "string"}},
+        "metadata": {"type": "dict", "values": {"type": "string"}},
+        "author":   {"type": "object", "fields": {
+          "name": {"type": "string", "required": true},
+          "age":  {"type": "integer"}
+        }}
+      }
+    }
+  }'
+```
+
+写入对应实体时 `data` 需符合复合结构，例如：
+
+```json
+{
+  "title": "复合类型演示",
+  "tags": ["python", "fastapi"],
+  "metadata": {"level": "beginner"},
+  "author": {"name": "alice", "age": 25}
+}
 ```
 
 ### 3. 查询元数据

@@ -1,9 +1,14 @@
-"""认证依赖：从 JWT 解析当前用户，提供 superuser 权限判定。
+"""认证依赖：从 JWT 解析当前用户，提供统一权限 Scope 判定。
 
 本服务不存储用户表，get_current_user 返回轻量的 CurrentUser 对象（仅含 JWT payload 字段）。
+
+权限模型：所有 Meta 操作（list / get / create / update / delete）统一经过 MetaScope 判定。
+- GLOBAL scope（superuser）：可操作任意 service；
+- SERVICE scope（普通 service 身份）：仅可操作自身 service。
 """
 
-from typing import Annotated
+from enum import Enum
+from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -80,17 +85,88 @@ def is_superuser(user: CurrentUser) -> bool:
 async def get_superuser_flag(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> bool:
-    """返回当前用户是否为 superuser（非强制依赖，用于需要跨服务权限判断的接口）。"""
+    """返回当前用户是否为 superuser（供 get_meta_scope 合成权限 Scope）。"""
     return is_superuser(current_user)
 
 
-async def require_superuser(
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
-) -> CurrentUser:
-    """管理接口依赖：仅 superuser 可调用，否则返回 403。"""
-    if not is_superuser(current_user):
+class Scope(str, Enum):
+    """权限作用域：所有 Meta 操作共用的判定维度。"""
+
+    GLOBAL = "global"  # superuser：可操作任意 service
+    SERVICE = "service"  # 普通 service 身份：仅可操作自身 service
+
+
+class MetaScope:
+    """统一权限 Scope：所有 Meta 操作（list / get / create / update / delete）共用的判定入口。
+
+    规则：
+    - GLOBAL scope（superuser）：可访问/操作任意 service；
+    - SERVICE scope（普通身份）：仅可访问/操作自身 service，显式跨 service 一律 403。
+    """
+
+    def __init__(self, user: CurrentUser, is_superuser: bool) -> None:
+        self.user = user
+        self.is_superuser = is_superuser
+        self.scope = Scope.GLOBAL if is_superuser else Scope.SERVICE
+
+    @property
+    def service_name(self) -> str:
+        """当前身份所属 service。"""
+        return self.user.service_name
+
+    def require_global(self, *, action: str) -> None:
+        """管理类操作（如类型 create/update/delete）：仅 GLOBAL scope 允许。"""
+        if self.scope != Scope.GLOBAL:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"仅超级用户可{action}",
+            )
+
+    def resolve_target(self, requested: str | None, *, action: str) -> str:
+        """解析单实体/创建操作的目标 service（默认自身）。
+
+        - 未指定 → 当前身份所属 service；
+        - 显式指定且与自身不同 → 仅 GLOBAL scope 允许，否则 403。
+        """
+        if requested is None:
+            return self.service_name
+        if requested != self.service_name and self.scope != Scope.GLOBAL:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"仅超级用户可跨服务{action}，当前身份仅可操作服务 {self.service_name}",
+            )
+        return requested
+
+    def resolve_filter(self, requested: str | None, *, action: str) -> str | None:
+        """解析列表/查询操作的 service 过滤条件；返回 None 表示不限。
+
+        - GLOBAL：未指定 → None（全部服务）；指定 → 按指定过滤；
+        - SERVICE：强制返回自身 service；显式指定其他服务 → 403。
+        """
+        if self.scope == Scope.GLOBAL:
+            return requested
+        if requested is not None and requested != self.service_name:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"仅超级用户可跨服务{action}，当前身份仅可查看服务 {self.service_name}",
+            )
+        return self.service_name
+
+    def check_entry_access(self, entry: Any, *, action: str) -> None:
+        """校验单实体访问：GLOBAL 放行；SERVICE 仅允许自身 service，越权 403。"""
+        if self.scope == Scope.GLOBAL:
+            return
+        if entry.service_name == self.service_name:
+            return
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="仅超级用户可执行此操作",
+            detail="无权访问此元数据",
         )
-    return current_user
+
+
+async def get_meta_scope(
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    is_superuser: Annotated[bool, Depends(get_superuser_flag)],
+) -> MetaScope:
+    """统一权限 Scope 依赖：所有 Meta 操作通过它做权限判定。"""
+    return MetaScope(user=current_user, is_superuser=is_superuser)

@@ -475,3 +475,147 @@ async def test_list_types_superuser_sees_all_services(client):
     data = response.json()
     assert data["total"] == 2
     assert {item["type_name"] for item in data["items"]} == {"forum_post", "default_post"}
+
+
+# ── 复合类型（list / dict / object）────────────────────────
+
+COMPOSITE_SCHEMA = {
+    "fields": {
+        "title": {"type": "string", "required": True},
+        "tags": {"type": "list", "items": {"type": "string"}},
+        "metadata": {"type": "dict", "values": {"type": "string"}},
+        "author": {
+            "type": "object",
+            "fields": {
+                "name": {"type": "string", "required": True},
+                "age": {"type": "integer"},
+            },
+        },
+    }
+}
+
+
+@pytest.mark.asyncio
+async def test_create_type_with_composite_fields(client):
+    """测试创建含 list/dict/object 复合字段的类型成功。"""
+    response = await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={
+            "type_name": "article",
+            "service_name": "forum",
+            "description": "复合类型测试",
+            "schema_json": COMPOSITE_SCHEMA,
+        },
+    )
+    assert response.status_code == 201
+    fields = response.json()["schema_json"]["fields"]
+    assert fields["tags"]["type"] == "list"
+    assert fields["tags"]["items"]["type"] == "string"
+    assert fields["metadata"]["type"] == "dict"
+    assert fields["metadata"]["values"]["type"] == "string"
+    assert fields["author"]["type"] == "object"
+    assert fields["author"]["fields"]["name"]["type"] == "string"
+
+
+@pytest.mark.asyncio
+async def test_create_type_invalid_composite_nested_type_422(client):
+    """测试复合字段子类型不支持返回 422。"""
+    bad_schema = {"fields": {"tags": {"type": "list", "items": {"type": "array"}}}}
+    response = await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "bad_comp", "service_name": "forum", "schema_json": bad_schema},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_type_object_fields_not_dict_422(client):
+    """测试 object.fields 非对象返回 422。"""
+    bad_schema = {"fields": {"author": {"type": "object", "fields": ["not", "a", "dict"]}}}
+    response = await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "bad_obj", "service_name": "forum", "schema_json": bad_schema},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_type_change_list_items_type_422(client):
+    """测试修改 list 的 items 子类型返回 422。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "article", "service_name": "forum", "schema_json": COMPOSITE_SCHEMA},
+    )
+    bad_schema = {
+        "fields": {
+            **COMPOSITE_SCHEMA["fields"],
+            "tags": {"type": "list", "items": {"type": "integer"}},  # string → integer
+        }
+    }
+    response = await client.put(
+        "/api/v1/types/article",
+        headers=_superuser_headers(),
+        json={"schema_json": bad_schema},
+    )
+    assert response.status_code == 422
+    assert "不允许修改字段" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_type_remove_object_subfield_422(client):
+    """测试移除 object 子字段返回 422。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "article", "service_name": "forum", "schema_json": COMPOSITE_SCHEMA},
+    )
+    bad_schema = {
+        "fields": {
+            **COMPOSITE_SCHEMA["fields"],
+            "author": {
+                "type": "object",
+                "fields": {"name": {"type": "string", "required": True}},  # 移除 age
+            },
+        }
+    }
+    response = await client.put(
+        "/api/v1/types/article",
+        headers=_superuser_headers(),
+        json={"schema_json": bad_schema},
+    )
+    assert response.status_code == 422
+    assert "不允许移除字段" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_type_add_object_subfield_ok(client):
+    """测试 object 内新增子字段允许（向后兼容）。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "article", "service_name": "forum", "schema_json": COMPOSITE_SCHEMA},
+    )
+    new_schema = {
+        "fields": {
+            **COMPOSITE_SCHEMA["fields"],
+            "author": {
+                "type": "object",
+                "fields": {
+                    "name": {"type": "string", "required": True},
+                    "age": {"type": "integer"},
+                    "email": {"type": "string"},  # 新增子字段
+                },
+            },
+        }
+    }
+    response = await client.put(
+        "/api/v1/types/article",
+        headers=_superuser_headers(),
+        json={"schema_json": new_schema},
+    )
+    assert response.status_code == 200
+    assert "email" in response.json()["schema_json"]["fields"]["author"]["fields"]

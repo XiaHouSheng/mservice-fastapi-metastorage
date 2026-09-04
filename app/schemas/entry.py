@@ -12,6 +12,9 @@ class MetadataEntryCreate(BaseModel):
     entity_key: str = Field(..., min_length=1, max_length=255, pattern=ENTITY_KEY_PATTERN)
     data: dict = Field(..., description="元数据 JSON，按类型 schema 校验")
     tags: list[str] = Field(default_factory=list, description="标签列表")
+    service_name: str | None = Field(
+        None, description="目标业务名（仅 superuser 可指定其他服务，默认当前用户所属服务）"
+    )
 
 
 class MetadataEntryUpdate(BaseModel):

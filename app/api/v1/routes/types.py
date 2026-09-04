@@ -1,42 +1,14 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.dependencies import (
-    CurrentUser,
-    get_current_user,
-    get_superuser_flag,
-    require_superuser,
-)
+from app.core.dependencies import MetaScope, get_meta_scope
 from app.schemas.type import MetadataTypeCreate, MetadataTypeResponse, MetadataTypeUpdate
 from app.services.type_service import TypeService
 
 router = APIRouter(prefix="/types", tags=["元数据类型管理"])
-
-
-def _resolve_service_name(
-    service_name: str | None,
-    current_user: CurrentUser,
-    is_superuser: bool,
-    *,
-    action: str,
-) -> str:
-    """解析目标服务名并做跨服务权限校验。
-
-    规则：
-    - 未显式指定 service_name → 使用当前登录用户所属服务；
-    - 显式指定了与自身不同的 service_name → 仅 superuser 允许，否则 403。
-    """
-    if service_name is None:
-        return current_user.service_name
-    if service_name != current_user.service_name and not is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"仅超级用户可跨服务{action}，当前用户仅可操作服务 {current_user.service_name}",
-        )
-    return service_name
 
 
 @router.post(
@@ -47,39 +19,25 @@ def _resolve_service_name(
 )
 async def create_type(
     type_data: MetadataTypeCreate,
-    current_user: Annotated[CurrentUser, Depends(require_superuser)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """创建元数据类型（平台级管理操作，仅 superuser 可调用）。"""
+    """创建元数据类型（平台级管理操作，仅 superuser / GLOBAL scope 可调用）。"""
+    meta_scope.require_global(action="创建元数据类型")
     type_service = TypeService(db)
     return await type_service.create_type(type_data)
 
 
 @router.get("", summary="元数据类型列表（登录用户）")
 async def list_types(
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
-    is_superuser: Annotated[bool, Depends(get_superuser_flag)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     skip: int = Query(0, ge=0, description="跳过条数"),
     limit: int = Query(20, ge=1, le=100, description="每页条数"),
     service_name: str | None = Query(None, description="按业务名筛选（跨服务需 superuser）"),
 ) -> dict[str, object]:
-    """分页获取元数据类型列表。"""
-    # 显式跨服务筛选：仅 superuser 允许
-    if (
-        service_name is not None
-        and service_name != current_user.service_name
-        and not is_superuser
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"仅超级用户可跨服务查看，当前用户仅可查看服务 {current_user.service_name}",
-        )
-    # 普通用户未指定时强制限定自身服务；superuser 未指定时返回所有服务
-    target_service = service_name
-    if target_service is None and not is_superuser:
-        target_service = current_user.service_name
-
+    """分页获取元数据类型列表（统一 Scope：普通身份仅自身 service，superuser 可见全部）。"""
+    target_service = meta_scope.resolve_filter(service_name, action="查看类型")
     type_service = TypeService(db)
     types, total = await type_service.list_types(
         skip=skip, limit=limit, service_name=target_service
@@ -94,18 +52,12 @@ async def list_types(
 )
 async def get_type(
     type_name: str,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
-    is_superuser: Annotated[bool, Depends(get_superuser_flag)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     service_name: str | None = Query(None, description="业务名（跨服务查询需 superuser）"),
 ):
-    """根据 type_name 获取类型详情（含 schema）。"""
-    target_service = _resolve_service_name(
-        service_name,
-        current_user,
-        is_superuser,
-        action="查询类型",
-    )
+    """根据 type_name 获取类型详情（含 schema，统一 Scope 判定）。"""
+    target_service = meta_scope.resolve_target(service_name, action="查询类型")
     type_service = TypeService(db)
     return await type_service.get_type_by_name(type_name, target_service)
 
@@ -118,12 +70,13 @@ async def get_type(
 async def update_type(
     type_name: str,
     update_data: MetadataTypeUpdate,
-    current_user: Annotated[CurrentUser, Depends(require_superuser)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     service_name: str | None = Query(None, description="业务名（默认当前用户所属服务）"),
 ):
-    """更新元数据类型（仅允许新增字段，向后兼容）。"""
-    target_service = service_name or current_user.service_name
+    """更新元数据类型（仅允许新增字段，向后兼容；仅 superuser / GLOBAL scope）。"""
+    meta_scope.require_global(action="更新元数据类型")
+    target_service = meta_scope.resolve_target(service_name, action="更新元数据类型")
     type_service = TypeService(db)
     return await type_service.update_type(type_name, target_service, update_data)
 
@@ -135,11 +88,12 @@ async def update_type(
 )
 async def delete_type(
     type_name: str,
-    current_user: Annotated[CurrentUser, Depends(require_superuser)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     service_name: str | None = Query(None, description="业务名（默认当前用户所属服务）"),
 ):
-    """软删除元数据类型（已有实体数据的类型禁止删除）。"""
-    target_service = service_name or current_user.service_name
+    """软删除元数据类型（已有实体数据的类型禁止删除；仅 superuser / GLOBAL scope）。"""
+    meta_scope.require_global(action="删除元数据类型")
+    target_service = meta_scope.resolve_target(service_name, action="删除元数据类型")
     type_service = TypeService(db)
     await type_service.delete_type(type_name, target_service)

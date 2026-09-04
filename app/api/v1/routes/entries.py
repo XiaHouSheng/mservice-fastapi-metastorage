@@ -5,11 +5,10 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.dependencies import CurrentUser, get_current_user
+from app.core.dependencies import MetaScope, get_meta_scope
 from app.repositories.type_repository import TypeRepository
 from app.schemas.entry import (
     MetadataEntryCreate,
-    MetadataEntryResponse,
     MetadataEntryUpdate,
     MetadataVersionResponse,
     RollbackRequest,
@@ -22,6 +21,7 @@ router = APIRouter(prefix="/entries", tags=["元数据实体管理"])
 _KNOWN_QUERY_PARAMS = {
     "type_name",
     "tags",
+    "service_name",
     "page",
     "page_size",
     "sort_by",
@@ -54,12 +54,12 @@ def _entry_to_response(entry, type_name: str) -> dict[str, Any]:
 )
 async def create_entry(
     entry_data: MetadataEntryCreate,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict[str, Any]:
-    """创建实体元数据。"""
+    """创建实体元数据（统一 Scope：普通身份仅本 service，superuser 可指定跨 service）。"""
     entry_service = EntryService(db)
-    entry = await entry_service.create_entry(entry_data, current_user)
+    entry = await entry_service.create_entry(entry_data, meta_scope.user, meta_scope)
     return _entry_to_response(entry, entry_data.type_name)
 
 
@@ -70,13 +70,13 @@ async def create_entry(
 async def get_entry(
     type_name: str,
     entity_key: str,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     version: int | None = Query(None, ge=1, description="指定历史版本号，默认最新"),
 ) -> dict[str, Any]:
-    """获取实体元数据（支持读取历史版本）。"""
+    """获取实体元数据（支持读取历史版本；统一 Scope 判定，superuser 可跨服务）。"""
     entry_service = EntryService(db)
-    entry = await entry_service.get_entry(type_name, entity_key, current_user, version)
+    entry = await entry_service.get_entry(type_name, entity_key, meta_scope, version)
     return _entry_to_response(entry, type_name)
 
 
@@ -88,12 +88,14 @@ async def update_entry(
     type_name: str,
     entity_key: str,
     update_data: MetadataEntryUpdate,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict[str, Any]:
-    """更新实体元数据（部分更新 deep merge，版本自增，保留历史版本）。"""
+    """更新实体元数据（部分更新 deep merge，版本自增；统一 Scope 判定，superuser 可跨服务）。"""
     entry_service = EntryService(db)
-    entry = await entry_service.update_entry(type_name, entity_key, update_data, current_user)
+    entry = await entry_service.update_entry(
+        type_name, entity_key, update_data, meta_scope.user, meta_scope
+    )
     return _entry_to_response(entry, type_name)
 
 
@@ -105,21 +107,22 @@ async def update_entry(
 async def delete_entry(
     type_name: str,
     entity_key: str,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> None:
-    """软删除实体元数据。"""
+    """软删除实体元数据（统一 Scope 判定，superuser 可跨服务）。"""
     entry_service = EntryService(db)
-    await entry_service.delete_entry(type_name, entity_key, current_user)
+    await entry_service.delete_entry(type_name, entity_key, meta_scope)
 
 
 @router.get("", summary="查询元数据（字段过滤 + tags + 分页 + 排序）")
 async def query_entries(
     request: Request,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     type_name: str | None = Query(None, description="按类型名筛选"),
     tags: str | None = Query(None, description="标签交集过滤，逗号分隔"),
+    service_name: str | None = Query(None, description="按业务名筛选（跨服务仅 superuser）"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
     sort_by: str = Query("created_at", description="排序字段"),
@@ -127,7 +130,10 @@ async def query_entries(
     created_after: datetime | None = Query(None, description="创建时间起"),
     created_before: datetime | None = Query(None, description="创建时间止"),
 ) -> dict[str, Any]:
-    """复杂查询：字段过滤（任意 query param）+ tags 交集 + 时间范围 + 分页 + 排序。"""
+    """复杂查询：字段过滤（任意 query param）+ tags 交集 + 时间范围 + 分页 + 排序。
+
+    统一 Scope 判定（resolve_filter）：普通身份仅查询自身 service，superuser 可查询全部/按 service 筛选。
+    """
     # 从任意 query params 中提取字段过滤器（排除已知参数）
     field_filters: dict[str, Any] = {}
     for key, value in request.query_params.multi_items():
@@ -140,7 +146,8 @@ async def query_entries(
     entry_service = EntryService(db)
     skip = (page - 1) * page_size
     entries, total = await entry_service.query_entries(
-        current_user,
+        meta_scope,
+        service_name=service_name,
         type_name=type_name,
         field_filters=field_filters if field_filters else None,
         tags=tag_list,
@@ -171,16 +178,16 @@ async def query_entries(
 async def list_versions(
     type_name: str,
     entity_key: str,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(50, ge=1, le=100, description="每页条数"),
 ) -> dict[str, Any]:
-    """获取实体的版本历史列表。"""
+    """获取实体的版本历史列表（统一 Scope 判定，superuser 可跨服务）。"""
     entry_service = EntryService(db)
     skip = (page - 1) * page_size
     versions, total = await entry_service.get_versions(
-        type_name, entity_key, current_user, skip=skip, limit=page_size
+        type_name, entity_key, meta_scope, skip=skip, limit=page_size
     )
     return {
         "total": total,
@@ -196,12 +203,12 @@ async def rollback_entry(
     type_name: str,
     entity_key: str,
     rollback_data: RollbackRequest,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict[str, Any]:
-    """回滚到指定版本（生成新版本，数据取回滚目标）。"""
+    """回滚到指定版本（生成新版本，数据取回滚目标；统一 Scope 判定，superuser 可跨服务）。"""
     entry_service = EntryService(db)
     entry = await entry_service.rollback_entry(
-        type_name, entity_key, rollback_data.version, current_user
+        type_name, entity_key, rollback_data.version, meta_scope.user, meta_scope
     )
     return _entry_to_response(entry, type_name)
