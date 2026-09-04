@@ -157,6 +157,7 @@ curl http://localhost:9093/health
 | PUT | `/entries/{type_name}/{entity_key}` | 更新元数据（deep merge，版本自增） | 登录用户 |
 | DELETE | `/entries/{type_name}/{entity_key}` | 软删除元数据 | 登录用户 |
 | GET | `/entries` | 查询（字段过滤 + tags + 分页 + 排序，`service_name` 跨服务筛选仅 superuser） | 登录用户 |
+| POST | `/entries/batch` | 批量查询（按 `keys` 列表返回 `{key: obj}`，未找到的 key 为 `null`） | 登录用户 |
 | GET | `/entries/{type_name}/{entity_key}/versions` | 版本历史列表 | 登录用户 |
 | POST | `/entries/{type_name}/{entity_key}/rollback` | 回滚到指定版本 | 登录用户 |
 | GET | `/health` | 健康检查 | 公开 |
@@ -283,6 +284,7 @@ Repository 层统一 LogProxy 包裹，`data` 中敏感 key（password/secret/to
 | `MAX_TAGS_PER_ENTRY` | 20 | 单条 entry 最多 tags 数 |
 | `MAX_TAG_LENGTH` | 50 | 单个 tag 最大长度 |
 | `MAX_VERSION_KEPT` | 50 | 保留历史版本上限 |
+| `MAX_BATCH_KEYS` | 200 | 批量查询单次 keys 数量上限 |
 | `ENTRY_KEY_MAX_LENGTH` | 255 | entity_key 最大长度 |
 | `LOG_LEVEL` | INFO | 日志级别 |
 | `LOG_FILE` | logs/meta_service.log | 日志文件路径 |
@@ -433,3 +435,20 @@ curl -X POST http://localhost:9093/api/v1/entries/forum_post/post-1001/rollback 
   -H "Content-Type: application/json" \
   -d '{"version": 1}'
 ```
+
+### 6. 批量查询（按 entity_key 列表）
+
+```bash
+curl -X POST http://localhost:9093/api/v1/entries/batch \
+  -H "Authorization: Bearer <normal_user_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type_name": "forum_post",
+    "keys": ["post-1001", "post-1002", "post-9999"]
+  }'
+# 返回 {"post-1001": {...obj...}, "post-1002": {...obj...}, "post-9999": null}
+```
+
+- 未找到 / 已软删 / 无权限访问的 key 返回 `null`（不报错）；
+- `keys` 数量上限 `MAX_BATCH_KEYS`（默认 200），超限返回 422；
+- 统一 Scope：普通身份仅查自身 service，superuser 可在请求体指定 `service_name` 跨服务查询。

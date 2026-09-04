@@ -11,7 +11,7 @@ from app.core.dependencies import CurrentUser, MetaScope
 from app.models.metadata_entry import MetadataEntry, MetadataVersion
 from app.proxy.log_proxy import LogProxy
 from app.repositories.entry_repository import EntryRepository
-from app.schemas.entry import MetadataEntryCreate, MetadataEntryUpdate
+from app.schemas.entry import BatchQueryRequest, MetadataEntryCreate, MetadataEntryUpdate
 from app.services.type_service import TypeService, validate_data_against_schema
 
 
@@ -124,6 +124,35 @@ class EntryService:
             entry.version = historical.version
             entry.updated_at = historical.created_at
         return entry
+
+    async def batch_get_entries(
+        self, batch_data: BatchQueryRequest, scope: MetaScope
+    ) -> list[MetadataEntry]:
+        """按 entity_key 列表批量查询实体（统一 Scope 判定）。
+
+        - 目标 service 由 scope.resolve_target 解析（普通身份仅本 service，superuser 可指定跨服务）；
+        - 类型不存在 → 404；单 key 找不到 → 由路由层映射为 null。
+        """
+        target_service = scope.resolve_target(batch_data.service_name, action="批量查询元数据")
+        # 去重并校验数量
+        unique_keys = list(dict.fromkeys(batch_data.keys))
+        if not unique_keys:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="keys 不能为空",
+            )
+        if len(unique_keys) > settings.MAX_BATCH_KEYS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"批量查询 keys 数量超过上限 {settings.MAX_BATCH_KEYS}",
+            )
+
+        metadata_type = await self.type_service.get_type_by_name(
+            batch_data.type_name, target_service
+        )
+        return await self.repo.get_by_type_and_keys(
+            metadata_type.id, unique_keys, service_name=target_service
+        )
 
     async def update_entry(
         self,

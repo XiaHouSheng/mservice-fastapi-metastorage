@@ -43,6 +43,23 @@ class EntryRepository:
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_type_and_keys(
+        self, type_id: int, keys: list[str], service_name: str | None = None
+    ) -> list[MetadataEntry]:
+        """根据 type_id + entity_key 列表批量获取实体（含软删除过滤）。
+
+        用于批量查询（batch get）：一次取回多个 key 对应的实体。
+        """
+        stmt = select(MetadataEntry).where(
+            MetadataEntry.type_id == type_id,
+            MetadataEntry.entity_key.in_(keys),
+            MetadataEntry.is_deleted == 0,
+        )
+        if service_name:
+            stmt = stmt.where(MetadataEntry.service_name == service_name)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_by_type_name_and_key(
         self, type_name: str, entity_key: str
     ) -> MetadataEntry | None:

@@ -1,8 +1,11 @@
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
 ENTITY_KEY_PATTERN = r"^[a-zA-Z0-9_\-\.]{1,255}$"
+
+EntityKey = Annotated[str, Field(min_length=1, max_length=255, pattern=ENTITY_KEY_PATTERN)]
 
 
 class MetadataEntryCreate(BaseModel):
@@ -22,6 +25,18 @@ class MetadataEntryUpdate(BaseModel):
 
     data: dict | None = Field(None, description="待合并的元数据 JSON（与现有 data 深度合并）")
     tags: list[str] | None = Field(None, description="完整替换 tags（非合并）")
+
+
+class BatchQueryRequest(BaseModel):
+    """批量查询实体请求：按 entity_key 列表一次取回多个对象。"""
+
+    type_name: str = Field(..., min_length=2, max_length=100)
+    keys: list[EntityKey] = Field(
+        ..., min_length=1, max_length=500, description="待查询的 entity_key 列表（不重复，数量上限见配置）"
+    )
+    service_name: str | None = Field(
+        None, description="目标业务名（仅 superuser 可指定其他服务，默认当前用户所属服务）"
+    )
 
 
 class MetadataEntryResponse(BaseModel):

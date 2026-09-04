@@ -806,3 +806,142 @@ async def test_normal_user_create_defaults_to_own_service(client):
     )
     assert response.status_code == 201
     assert response.json()["service_name"] == "forum"
+
+
+# ── 批量查询（batch get）──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_batch_get_returns_map_with_null_for_missing(client):
+    """测试批量查询返回 {key: obj}，未找到的 key 返回 null。"""
+    await _create_type(client)  # forum_post / forum
+    for key in ["post-001", "post-002"]:
+        await client.post(
+            "/api/v1/entries",
+            headers=_user_headers(),
+            json={
+                "type_name": "forum_post",
+                "entity_key": key,
+                "data": {"title": f"帖子{key}", "board": "技术"},
+                "tags": [],
+            },
+        )
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_user_headers(),
+        json={"type_name": "forum_post", "keys": ["post-001", "post-002", "post-missing"]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"post-001", "post-002", "post-missing"}
+    assert data["post-001"]["entity_key"] == "post-001"
+    assert data["post-002"]["entity_key"] == "post-002"
+    assert data["post-missing"] is None
+
+
+@pytest.mark.asyncio
+async def test_batch_get_only_own_service(client):
+    """测试普通用户批量查询仅返回自身 service 的数据（其他 service 的 key → null）。"""
+    await _create_type(client)  # forum_post / forum
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "forum_post", "service_name": "shop", "schema_json": FORUM_SCHEMA},
+    )
+    # forum 下创建 post-a
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=1, username="alice", service_name="forum"),
+        json={"type_name": "forum_post", "entity_key": "post-a", "data": {"title": "A", "board": "技术"}, "tags": []},
+    )
+    # shop 下创建 post-b
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=2, username="bob", service_name="shop"),
+        json={"type_name": "forum_post", "entity_key": "post-b", "data": {"title": "B", "board": "技术"}, "tags": []},
+    )
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_user_headers(service_name="forum"),
+        json={"type_name": "forum_post", "keys": ["post-a", "post-b"]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["post-a"]["entity_key"] == "post-a"
+    assert data["post-b"] is None
+
+
+@pytest.mark.asyncio
+async def test_batch_get_superuser_cross_service(client):
+    """测试 superuser 通过请求体 service_name 跨服务批量查询。"""
+    await _create_type(client)  # forum_post / forum
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(user_id=1, username="alice", service_name="forum"),
+        json={"type_name": "forum_post", "entity_key": "post-a", "data": {"title": "A", "board": "技术"}, "tags": []},
+    )
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_superuser_headers_for("default"),
+        json={"type_name": "forum_post", "keys": ["post-a"], "service_name": "forum"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["post-a"]["entity_key"] == "post-a"
+    assert data["post-a"]["service_name"] == "forum"
+
+
+@pytest.mark.asyncio
+async def test_batch_get_normal_user_cross_service_forbidden(client):
+    """测试普通用户批量查询指定其他 service 返回 403（统一 Scope）。"""
+    await _create_type(client)  # forum_post / forum
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_user_headers(service_name="forum"),
+        json={"type_name": "forum_post", "keys": ["post-a"], "service_name": "shop"},
+    )
+    assert response.status_code == 403
+    assert "仅超级用户可跨服务" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_batch_get_type_not_found_404(client):
+    """测试批量查询不存在的类型返回 404。"""
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_user_headers(),
+        json={"type_name": "nonexistent", "keys": ["post-a"]},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_batch_get_keys_over_limit_422(client):
+    """测试批量查询 keys 数量超过上限返回 422。"""
+    await _create_type(client)  # forum_post / forum
+    many_keys = [f"key-{i:04d}" for i in range(201)]  # > MAX_BATCH_KEYS(200)
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_user_headers(),
+        json={"type_name": "forum_post", "keys": many_keys},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_batch_get_soft_deleted_key_null(client):
+    """测试批量查询中已软删的 key 返回 null。"""
+    await _create_type(client)  # forum_post / forum
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(),
+        json={"type_name": "forum_post", "entity_key": "post-a", "data": {"title": "A", "board": "技术"}, "tags": []},
+    )
+    await client.delete("/api/v1/entries/forum_post/post-a", headers=_user_headers())
+    response = await client.post(
+        "/api/v1/entries/batch",
+        headers=_user_headers(),
+        json={"type_name": "forum_post", "keys": ["post-a"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["post-a"] is None

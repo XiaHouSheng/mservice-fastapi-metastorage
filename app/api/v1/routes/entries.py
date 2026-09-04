@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.core.dependencies import MetaScope, get_meta_scope
 from app.repositories.type_repository import TypeRepository
 from app.schemas.entry import (
+    BatchQueryRequest,
     MetadataEntryCreate,
     MetadataEntryUpdate,
     MetadataVersionResponse,
@@ -61,6 +62,25 @@ async def create_entry(
     entry_service = EntryService(db)
     entry = await entry_service.create_entry(entry_data, meta_scope.user, meta_scope)
     return _entry_to_response(entry, entry_data.type_name)
+
+
+@router.post(
+    "/batch",
+    summary="批量查询元数据（按 entity_key 列表）",
+)
+async def batch_get_entries(
+    batch_data: BatchQueryRequest,
+    meta_scope: Annotated[MetaScope, Depends(get_meta_scope)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, Any]:
+    """按 [key1, key2, ...] 批量查询实体，返回 {key: obj}；未找到的 key 返回 null。
+
+    统一 Scope 判定：普通身份仅可查自身 service，superuser 可指定跨 service（请求体 service_name）。
+    """
+    entry_service = EntryService(db)
+    entries = await entry_service.batch_get_entries(batch_data, meta_scope)
+    entry_map = {e.entity_key: _entry_to_response(e, batch_data.type_name) for e in entries}
+    return {key: entry_map.get(key) for key in batch_data.keys}
 
 
 @router.get(

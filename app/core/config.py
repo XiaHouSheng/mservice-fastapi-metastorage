@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     MAX_TAGS_PER_ENTRY: int = 20
     MAX_TAG_LENGTH: int = 50
     MAX_VERSION_KEPT: int = 50
+    MAX_BATCH_KEYS: int = 200
     ENTRY_KEY_MAX_LENGTH: int = 255
 
     # 日志
