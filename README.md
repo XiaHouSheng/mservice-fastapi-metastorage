@@ -150,7 +150,7 @@ curl http://localhost:9093/health
 | POST | `/types` | 创建元数据类型 | **仅 superuser** |
 | GET | `/types` | 类型列表（service_name 筛选、分页） | 登录用户 |
 | GET | `/types/{type_name}` | 获取类型详情（含 schema） | 登录用户 |
-| PUT | `/types/{type_name}` | 更新类型 schema（仅允许新增字段） | **仅 superuser** |
+| PUT | `/types/{type_name}` | 更新类型 schema（无实体数据时可删除字段，否则仅允许新增字段） | **仅 superuser** |
 | DELETE | `/types/{type_name}` | 软删除类型（有实体数据时拒绝） | **仅 superuser** |
 | POST | `/entries` | 创建实体元数据 | 登录用户 |
 | GET | `/entries/{type_name}/{entity_key}` | 获取元数据（支持 `?version=`） | 登录用户 |
@@ -230,11 +230,11 @@ JWKS 缓存带 TTL（`JWKS_CACHE_TTL_SECONDS`，默认 3600 秒）。
 
 ### Schema 更新规则（向后兼容）
 
-更新类型 schema 时**仅允许新增字段**：
-- 移除已有字段 → **422**；
-- 修改已有字段类型 → **422**；
+更新类型 schema 时，**类型下无实体数据时允许移除字段；存在实体数据时仅允许新增字段**：
+- 移除已有字段：类型下**无实体数据** → 允许；存在实体数据 → **422**；
+- 修改已有字段类型 → **422**（无论是否有实体数据）；
 - 新增可选/必填字段 → 允许；
-- 复合类型同样受限：修改 `list.items` / `dict.values` 的子类型 → **422**；移除 `object` 已有子字段 → **422**；`object` 内新增子字段 → 允许。
+- 复合类型同样受限：修改 `list.items` / `dict.values` 的子类型 → **422**；移除 `object` 已有子字段 → 无实体数据时允许，存在实体数据时 **422**；`object` 内新增子字段 → 允许。
 
 ### 版本管理与回滚
 

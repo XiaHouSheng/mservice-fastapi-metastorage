@@ -226,45 +226,65 @@ class TypeService:
     async def update_type(
         self, type_name: str, service_name: str, update_data: MetadataTypeUpdate
     ) -> MetadataType:
-        """更新元数据类型（仅允许新增字段，向后兼容）。"""
+        """更新元数据类型（类型下无实体数据时允许移除字段；有实体数据时仅允许新增字段）。"""
         metadata_type = await self.get_type_by_name(type_name, service_name)
 
         # 更新描述
         if update_data.description is not None:
             metadata_type.description = update_data.description
 
-        # 更新 schema：仅允许新增字段，拒绝移除或改字段类型
+        # 更新 schema：无实体数据时允许移除字段；有实体数据时仅允许新增字段，拒绝移除或改字段类型
         if update_data.schema_json is not None:
             new_schema = update_data.schema_json.model_dump()
             _validate_schema_fields(new_schema)
-            self._validate_schema_backward_compatible(metadata_type.schema_json, new_schema)
+            active_count = await self.repo.count_active_entries(metadata_type.id)
+            self._validate_schema_backward_compatible(
+                metadata_type.schema_json,
+                new_schema,
+                allow_remove_fields=active_count == 0,
+            )
             metadata_type.schema_json = new_schema
 
         return await self.repo.update(metadata_type)
 
     @staticmethod
-    def _validate_schema_backward_compatible(old_schema: dict, new_schema: dict) -> None:
-        """校验 schema 更新是否向后兼容：仅允许新增字段，拒绝移除或改类型（含复合类型递归）。"""
+    def _validate_schema_backward_compatible(
+        old_schema: dict, new_schema: dict, *, allow_remove_fields: bool = False
+    ) -> None:
+        """校验 schema 更新是否向后兼容：无实体数据（allow_remove_fields）时允许移除字段；
+        否则仅允许新增字段，拒绝移除或改类型（含复合类型递归）。"""
         old_fields = old_schema.get("fields", {})
         new_fields = new_schema.get("fields", {})
-        TypeService._validate_fields_backward(old_fields, new_fields, "")
+        TypeService._validate_fields_backward(
+            old_fields, new_fields, "", allow_remove_fields=allow_remove_fields
+        )
 
     @staticmethod
-    def _validate_fields_backward(old_fields: dict, new_fields: dict, path: str) -> None:
-        """递归校验字段集合：不允许移除字段、不允许修改已有字段类型。"""
+    def _validate_fields_backward(
+        old_fields: dict, new_fields: dict, path: str, *, allow_remove_fields: bool = False
+    ) -> None:
+        """递归校验字段集合：默认不允许移除字段、不允许修改已有字段类型；
+        allow_remove_fields=True（无实体数据）时允许移除字段。"""
         removed = set(old_fields.keys()) - set(new_fields.keys())
-        if removed:
+        if removed and not allow_remove_fields:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"不允许移除字段: {sorted(removed)}（仅支持新增字段）",
+                detail=f"不允许移除字段: {sorted(removed)}（类型下存在实体数据时仅支持新增字段）",
             )
         for field_name in old_fields:
+            if field_name not in new_fields:
+                continue  # 已移除的字段：allow_remove_fields 时允许
             TypeService._validate_field_backward(
-                old_fields[field_name], new_fields[field_name], f"{path}{field_name}"
+                old_fields[field_name],
+                new_fields[field_name],
+                f"{path}{field_name}",
+                allow_remove_fields=allow_remove_fields,
             )
 
     @staticmethod
-    def _validate_field_backward(old_def: dict, new_def: dict, path: str) -> None:
+    def _validate_field_backward(
+        old_def: dict, new_def: dict, path: str, *, allow_remove_fields: bool = False
+    ) -> None:
         """递归校验单个字段：类型不得变更；list/dict/object 的子定义递归校验。"""
         if not isinstance(new_def, dict):
             raise HTTPException(
@@ -281,11 +301,17 @@ class TypeService:
 
         if old_type == "list":
             TypeService._validate_subdef_backward(
-                old_def.get("items"), new_def.get("items"), f"{path}[items]"
+                old_def.get("items"),
+                new_def.get("items"),
+                f"{path}[items]",
+                allow_remove_fields=allow_remove_fields,
             )
         elif old_type == "dict":
             TypeService._validate_subdef_backward(
-                old_def.get("values"), new_def.get("values"), f"{path}[values]"
+                old_def.get("values"),
+                new_def.get("values"),
+                f"{path}[values]",
+                allow_remove_fields=allow_remove_fields,
             )
         elif old_type == "object":
             old_sub = old_def.get("fields") or {}
@@ -295,13 +321,23 @@ class TypeService:
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"字段 {path}.fields 必须是对象",
                 )
-            TypeService._validate_fields_backward(old_sub, new_sub, f"{path}.")
+            TypeService._validate_fields_backward(
+                old_sub, new_sub, f"{path}.", allow_remove_fields=allow_remove_fields
+            )
 
     @staticmethod
     def _validate_subdef_backward(
-        old_child: dict | None, new_child: dict | None, path: str
+        old_child: dict | None,
+        new_child: dict | None,
+        path: str,
+        *,
+        allow_remove_fields: bool = False,
     ) -> None:
-        """复合类型的子定义比较：旧无子定义时允许新增；旧有子定义时不允许移除，且递归比较。"""
+        """复合类型的子定义比较：旧无子定义时允许新增；旧有子定义时不允许移除，且递归比较。
+
+        allow_remove_fields=True（类型下无实体数据）时，允许移除 dict/list 内部嵌套
+        object 的子字段（如 dict.values.fields 中的字段），但移除子定义本身仍不允许。
+        """
         if old_child is None:
             return
         if new_child is None:
@@ -309,7 +345,9 @@ class TypeService:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"不允许移除 {path} 的子类型定义",
             )
-        TypeService._validate_field_backward(old_child, new_child, path)
+        TypeService._validate_field_backward(
+            old_child, new_child, path, allow_remove_fields=allow_remove_fields
+        )
 
     async def delete_type(self, type_name: str, service_name: str) -> None:
         """软删除元数据类型（已有实体数据的类型禁止删除）。"""

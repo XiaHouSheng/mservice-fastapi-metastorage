@@ -194,8 +194,8 @@ async def test_update_type_normal_user_forbidden(client):
 
 
 @pytest.mark.asyncio
-async def test_update_type_remove_field_422(client):
-    """测试更新类型时移除字段返回 422（不允许）。"""
+async def test_update_type_remove_field_no_entries_ok(client):
+    """测试类型下无实体数据时，superuser 移除字段成功。"""
     await client.post(
         "/api/v1/types",
         headers=_superuser_headers(),
@@ -205,7 +205,41 @@ async def test_update_type_remove_field_422(client):
             "schema_json": FORUM_SCHEMA,
         },
     )
-    # 移除 title 字段
+    # 移除 title 字段（该类型无实体数据，允许删除）
+    bad_schema = {"fields": {k: v for k, v in FORUM_SCHEMA["fields"].items() if k != "title"}}
+    response = await client.put(
+        "/api/v1/types/forum_post",
+        headers=_superuser_headers(),
+        json={"schema_json": bad_schema},
+    )
+    assert response.status_code == 200
+    assert "title" not in response.json()["schema_json"]["fields"]
+
+
+@pytest.mark.asyncio
+async def test_update_type_remove_field_with_entries_422(client):
+    """测试类型下存在实体数据时，移除字段仍返回 422（不允许）。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={
+            "type_name": "forum_post",
+            "service_name": "forum",
+            "schema_json": FORUM_SCHEMA,
+        },
+    )
+    # 创建一条实体数据
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(),
+        json={
+            "type_name": "forum_post",
+            "entity_key": "post-001",
+            "data": {"title": "测试帖子", "board": "技术", "likes": 10},
+            "tags": ["test"],
+        },
+    )
+    # 有实体数据时移除字段应被拒绝
     bad_schema = {"fields": {k: v for k, v in FORUM_SCHEMA["fields"].items() if k != "title"}}
     response = await client.put(
         "/api/v1/types/forum_post",
@@ -566,12 +600,52 @@ async def test_update_type_change_list_items_type_422(client):
 
 
 @pytest.mark.asyncio
-async def test_update_type_remove_object_subfield_422(client):
-    """测试移除 object 子字段返回 422。"""
+async def test_update_type_remove_object_subfield_no_entries_ok(client):
+    """测试类型下无实体数据时，移除 object 子字段成功。"""
     await client.post(
         "/api/v1/types",
         headers=_superuser_headers(),
         json={"type_name": "article", "service_name": "forum", "schema_json": COMPOSITE_SCHEMA},
+    )
+    bad_schema = {
+        "fields": {
+            **COMPOSITE_SCHEMA["fields"],
+            "author": {
+                "type": "object",
+                "fields": {"name": {"type": "string", "required": True}},  # 移除 age
+            },
+        }
+    }
+    response = await client.put(
+        "/api/v1/types/article",
+        headers=_superuser_headers(),
+        json={"schema_json": bad_schema},
+    )
+    assert response.status_code == 200
+    assert "age" not in response.json()["schema_json"]["fields"]["author"]["fields"]
+
+
+@pytest.mark.asyncio
+async def test_update_type_remove_object_subfield_with_entries_422(client):
+    """测试类型下存在实体数据时，移除 object 子字段返回 422（不允许）。"""
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "article", "service_name": "forum", "schema_json": COMPOSITE_SCHEMA},
+    )
+    await client.post(
+        "/api/v1/entries",
+        headers=_user_headers(),
+        json={
+            "type_name": "article",
+            "entity_key": "article-001",
+            "data": {
+                "title": "测试文章",
+                "tags": ["a"],
+                "metadata": {"k": "v"},
+                "author": {"name": "张三", "age": 20},
+            },
+        },
     )
     bad_schema = {
         "fields": {
@@ -619,3 +693,97 @@ async def test_update_type_add_object_subfield_ok(client):
     )
     assert response.status_code == 200
     assert "email" in response.json()["schema_json"]["fields"]["author"]["fields"]
+
+
+@pytest.mark.asyncio
+async def test_update_type_remove_dict_nested_field_no_entries_ok(client):
+    """测试无实体数据时，允许移除 dict.values.fields 中的嵌套字段。"""
+    schema = {
+        "fields": {
+            "foods": {
+                "type": "dict",
+                "values": {
+                    "type": "object",
+                    "fields": {
+                        "name": {"type": "string", "required": True},
+                        "tips": {"type": "string", "required": False},
+                    },
+                },
+            }
+        }
+    }
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "meal", "service_name": "caloplan", "schema_json": schema},
+    )
+    new_schema = {
+        "fields": {
+            "foods": {
+                "type": "dict",
+                "values": {
+                    "type": "object",
+                    "fields": {"name": {"type": "string", "required": True}},
+                },
+            }
+        }
+    }
+    response = await client.put(
+        "/api/v1/types/meal?service_name=caloplan",
+        headers=_superuser_headers(),
+        json={"schema_json": new_schema},
+    )
+    assert response.status_code == 200
+    assert "tips" not in response.json()["schema_json"]["fields"]["foods"]["values"]["fields"]
+
+
+@pytest.mark.asyncio
+async def test_update_type_remove_dict_nested_field_with_entries_422(client):
+    """测试有实体数据时，移除 dict.values.fields 中的嵌套字段返回 422。"""
+    schema = {
+        "fields": {
+            "foods": {
+                "type": "dict",
+                "values": {
+                    "type": "object",
+                    "fields": {
+                        "name": {"type": "string", "required": True},
+                        "tips": {"type": "string", "required": False},
+                    },
+                },
+            }
+        }
+    }
+    await client.post(
+        "/api/v1/types",
+        headers=_superuser_headers(),
+        json={"type_name": "meal", "service_name": "caloplan", "schema_json": schema},
+    )
+    await client.post(
+        "/api/v1/entries",
+        headers={"Authorization": f"Bearer {create_test_token(user_id=1, username='testuser', role='user', service_name='caloplan')}"},
+        json={
+            "type_name": "meal",
+            "service_name": "caloplan",
+            "entity_key": "meal-001",
+            "data": {"foods": {"f1": {"name": "苹果"}}},
+        },
+    )
+    new_schema = {
+        "fields": {
+            "foods": {
+                "type": "dict",
+                "values": {
+                    "type": "object",
+                    "fields": {"name": {"type": "string", "required": True}},
+                },
+            }
+        }
+    }
+    response = await client.put(
+        "/api/v1/types/meal?service_name=caloplan",
+        headers=_superuser_headers(),
+        json={"schema_json": new_schema},
+    )
+    assert response.status_code == 422
+    assert "不允许移除字段" in response.json()["detail"]
